@@ -22,7 +22,9 @@
 #if HEADLESS
 
 class FullInterface { };
+#ifndef JUCE_AUDIO_DEVICES_H_INCLUDED
 class AudioDeviceManager { };
+#endif
 
 #endif
 

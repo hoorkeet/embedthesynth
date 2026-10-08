@@ -18,6 +18,7 @@
 #include "load_save.h"
 #include "tuning.h"
 #include "synth_base.h"
+#include "live_synth.h"
 
 String getArgumentValue(int argc, const char* argv[], const String& flag, const String& full_flag) {
   for (int i = 0; i < argc - 1; ++i) {
@@ -128,6 +129,11 @@ bool loadFromCommandLine(HeadlessSynth& synth, const String& command_line) {
 }
 
 int main(int argc, const char* argv[]) {
+  for (int i = 1; i < argc; ++i) {
+    if (std::string(argv[i]) == "--live")
+      return runLiveSynth(getArgumentValue(argc, argv, "-c", "--config"));
+  }
+
   HeadlessSynth headless_synth;
   
   bool last_arg_was_option = false;
