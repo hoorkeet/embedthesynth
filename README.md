@@ -1,27 +1,27 @@
-# Vital
-Vital is a spectral warping wavetable synthesizer. This is the source.
+# embedthesynth
 
-This repository is updated on a delay after binary releases.
+A headless, GUI-less fork of the open-source Vital synthesizer engine, modified to run several instances on a Raspberry Pi 5 and to load presets by MIDI
+program change.
 
-## Code Licensing
-If you are making a proprietary or closed source app and would like to use Vital's source code, contact licensing@vital.audio for non GPLv3 licensing options.
+This project is a modified version of Vital by Matt Tytel and is licensed under the GNU General Public License v3.0 (see LICENSE). It is not affiliated with, endorsed by, or supported by Vital Audio or the original authors. "Vital" is a trademark of its owner.
 
-## Installing
-Create an account and download Vital at [vital.audio](https://vital.audio)
+## Modifications
+Changes from upstream (see commit history for details):
+- Removed the GUI; sound generation only
+- Preset loading via MIDI program change
+Planned:
+- Support for multiple engine instances
+- Build changes for Raspberry Pi 5 (ARM64)
+For details check this project commit history.
 
-## Issues
-Report bugs (e.g.non-code and non-compiling issues) to https://forum.vital.audio
+## Performance note
+CPU load depends heavily on the preset. Presets with high unison, oversampling or many active voices can cause audio dropouts on a Raspberry Pi 5, especially with several instances running. It is up to user to choose presets accordingly.
 
-Feel free to report issues on building/compiling here but note that I'm not prioritizing them.
+## Building
+make headless_server 2>&1 | grep -E "error|Error" | head -20
 
-## Pull requests
-I will not take any pull requests.
+To send prog change from another bash:
+python3 -c "import sys; sys.stdout.buffer.write(b'MThd\x00\x00\x00\x06\x00\x00\x00\x01\x00\x60MTrk\x00\x00\x00\x07\x00\xc0\x00\x00\xff\x2f\x00')" | aplaymidi -p 128:0 -
 
-## What can you do with the source
-The source code is licensed under the GPLv3. If you download the source or create builds you must comply with that license.
-
-### Things you can't do with this source
- - Do not create an app and distribute it on the iOS app store. The app store is not comptabile with GPLv3 and you'll only get an exception for this if you're paying for a GPLv3 exception for Vital's source (see Code Licensing above).
- - Do not use the name "Vital", "Vital Audio", "Tytel" or "Matt Tytel" for marketing or to name any distribution of binaries built with this source. This source code does not give you rights to infringe on trademarks.
- - Do not connect to any web service at https://vital.audio, https://account.vital.audio or https://store.vital.audio from your own builds. This is against the terms of using those sites.
- - Do not distribute the presets that come with the free version of Vital. They're under a separate license that does not allow redistribution.
+## Original Vital README
+See ORIGINAL-VITAL-README.md
