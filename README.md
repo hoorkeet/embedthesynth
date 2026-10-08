@@ -17,9 +17,10 @@ For details check this project commit history.
 ## Performance note
 CPU load depends heavily on the preset. Presets with high unison, oversampling or many active voices can cause audio dropouts on a Raspberry Pi 5, especially with several instances running. It is up to user to choose presets accordingly.
 
-## Building
+## Building & run
 make headless_server 2>&1 | grep -E "error|Error" | head -20
-
+Put your *.vital files in patches dir
+./headless/builds/linux/build/vital --live --config live.json
 To send prog change from another bash:
 python3 -c "import sys; sys.stdout.buffer.write(b'MThd\x00\x00\x00\x06\x00\x00\x00\x01\x00\x60MTrk\x00\x00\x00\x07\x00\xc0\x00\x00\xff\x2f\x00')" | aplaymidi -p 128:0 -
 
