@@ -1,14 +1,10 @@
 {
-  "midi_port_name": "Vital",
+  "patch_dir": "patches",
+  "midi_port_name": "BASS",
+  "midi_inputs": "",
   "audio_device": "",
   "sample_rate": 48000,
   "buffer_size": 256,
   "default_program": 0,
-  "program_channel": 0,
-  "patch_dir": "patches",
-  "programs": {
-    "0": "Bass.vital",
-    "1": "Pad.vital",
-    "2": "Pluck.vital"
-  }
+  "program_channel": 0
 }

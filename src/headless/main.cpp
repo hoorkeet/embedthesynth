@@ -131,7 +131,7 @@ bool loadFromCommandLine(HeadlessSynth& synth, const String& command_line) {
 int main(int argc, const char* argv[]) {
   for (int i = 1; i < argc; ++i) {
     if (std::string(argv[i]) == "--live")
-      return runLiveSynth(getArgumentValue(argc, argv, "-c", "--config"));
+      return runLiveSynth(argc, argv);
   }
 
   HeadlessSynth headless_synth;

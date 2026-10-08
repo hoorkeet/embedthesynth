@@ -20,9 +20,9 @@ CPU load depends heavily on the preset. Presets with high unison, oversampling o
 ## Building & run
 make headless_server 2>&1 | grep -E "error|Error" | head -20
 
-Put your *.vital files in patches dir. Connect external midi controller.
+Put your *.vital files in patches dir, each should start with 3 digits, marking the program number e.g. 005_bass.vital or "007 bond vibe.vital". Connect external midi controller.
 
-./headless/builds/linux/build/vital --live --config live.json
+./headless/builds/linux/build/vital --live --patches patches --port-name BASS --midi-inputs Akai
 
 In case your controller doesn't support - send prog change from another bash: python3 -c "import sys; sys.stdout.buffer.write(b'MThd\x00\x00\x00\x06\x00\x00\x00\x01\x00\x60MTrk\x00\x00\x00\x07\x00\xc0\x00\x00\xff\x2f\x00')" | aplaymidi -p 128:0 -
 

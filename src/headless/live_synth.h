@@ -1,6 +1,6 @@
 // Live (non-render) mode for the headless Vital build.
-// Header-only: audio output via ALSA, MIDI via a virtual ALSA port plus
-// auto-enabled hardware ports, Program Change -> patch file map from JSON.
+// Header-only: ALSA audio, virtual ALSA MIDI port (+ optional hardware inputs),
+// Program Change N -> first "<N>*.vital" file in a patch directory.
 #pragma once
 
 #include "JuceHeader.h"
@@ -9,12 +9,14 @@
 #include "synth_base.h"
 #include "synth_constants.h"
 
+#include <algorithm>
 #include <atomic>
 #include <csignal>
 #include <iostream>
 #include <map>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace live {
   inline volatile std::sig_atomic_t& quitFlag() {
@@ -28,21 +30,53 @@ namespace live {
   inline std::unique_ptr<MidiInput> wrapMidiInput(std::unique_ptr<MidiInput> input) { return input; }
 
   inline void log(const String& message) { std::cout << message.toRawUTF8() << std::endl; }
+
+  // Accepts "--name value" and "--name=value".
+  inline bool argValue(int argc, const char* argv[], const char* name, String& value) {
+    const std::string flag(name);
+    const std::string prefix = flag + "=";
+    for (int i = 1; i < argc; ++i) {
+      std::string arg = argv[i];
+      if (arg == flag && i + 1 < argc) {
+        value = String::fromUTF8(argv[i + 1]);
+        return true;
+      }
+      if (arg.compare(0, prefix.size(), prefix) == 0) {
+        value = String::fromUTF8(arg.c_str() + prefix.size());
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // "000_bass.vital", "5 lead", "037 wah fender.vital" -> 0, 5, 37. Not a program: "1234_x", "bass".
+  inline int programFromName(const String& name) {
+    int digits = 0;
+    while (digits < name.length() && CharacterFunctions::isDigit(name[digits]))
+      ++digits;
+    if (digits == 0 || digits > 3)
+      return -1;
+    int program = name.substring(0, digits).getIntValue();
+    return program <= 127 ? program : -1;
+  }
 }
 
 class LiveSynth : public HeadlessSynth, public AudioSource, private Timer {
   public:
     struct Config {
+      File patch_dir;
       String midi_port_name = "Vital";
+      String midi_inputs;                        // hardware MIDI: "" = none, "all", or "Akai,Keystation" (name substrings)
       String audio_device;                       // empty = system default
       double sample_rate = vital::kDefaultSampleRate;
       int buffer_size = 256;
-      int default_program = -1;                  // -1 = init preset
+      int default_program = 0;                   // loaded at startup; -1 = init preset
       int program_channel = 0;                   // 0 = any channel, 1-16 = only that channel
-      std::map<int, File> programs;              // Program Change number -> .vital file
     };
 
-    static bool loadConfig(const File& config_file, Config& config, String& error) {
+    // Optional JSON config; keys: patch_dir, midi_port_name, midi_inputs, audio_device,
+    // sample_rate, buffer_size, default_program, program_channel. Command line overrides it.
+    static bool loadConfigFile(const File& config_file, Config& config, String& error) {
       try {
         json data = json::parse(config_file.loadFileAsString().toStdString(), nullptr);
         if (!data.is_object()) {
@@ -50,31 +84,59 @@ class LiveSynth : public HeadlessSynth, public AudioSource, private Timer {
           return false;
         }
 
-        config.midi_port_name = String::fromUTF8(data.value("midi_port_name", std::string("Vital")).c_str());
-        config.audio_device = String::fromUTF8(data.value("audio_device", std::string()).c_str());
-        config.sample_rate = data.value("sample_rate", (double)vital::kDefaultSampleRate);
-        config.buffer_size = data.value("buffer_size", 256);
-        config.default_program = data.value("default_program", -1);
-        config.program_channel = data.value("program_channel", 0);
+        auto str = [&](const char* key, const String& fallback) {
+          return data.count(key) ? String::fromUTF8(data[key].get<std::string>().c_str()) : fallback;
+        };
 
-        File base = config_file.getParentDirectory();
         if (data.count("patch_dir"))
-          base = base.getChildFile(String::fromUTF8(data["patch_dir"].get<std::string>().c_str()));
-
-        if (!data.count("programs") || !data["programs"].is_object()) {
-          error = "Config needs a \"programs\" object, e.g. {\"0\": \"Bass.vital\"}.";
-          return false;
-        }
-
-        for (auto it = data["programs"].begin(); it != data["programs"].end(); ++it) {
-          int program = std::stoi(it.key());
-          if (program < 0 || program > 127)
-            continue;
-          config.programs[program] = base.getChildFile(String::fromUTF8(it.value().get<std::string>().c_str()));
-        }
+          config.patch_dir = config_file.getParentDirectory().getChildFile(str("patch_dir", String()));
+        config.midi_port_name = str("midi_port_name", config.midi_port_name);
+        config.midi_inputs = str("midi_inputs", config.midi_inputs);
+        config.audio_device = str("audio_device", config.audio_device);
+        config.sample_rate = data.value("sample_rate", config.sample_rate);
+        config.buffer_size = data.value("buffer_size", config.buffer_size);
+        config.default_program = data.value("default_program", config.default_program);
+        config.program_channel = data.value("program_channel", config.program_channel);
       }
       catch (const std::exception& e) {
         error = String("Bad config: ") + e.what();
+        return false;
+      }
+      return true;
+    }
+
+    static bool parseCommandLine(int argc, const char* argv[], Config& config, String& error) {
+      String value;
+      if (live::argValue(argc, argv, "--config", value)) {
+        File config_file = File::getCurrentWorkingDirectory().getChildFile(value);
+        if (!config_file.existsAsFile()) {
+          error = "Config not found: " + config_file.getFullPathName();
+          return false;
+        }
+        if (!loadConfigFile(config_file, config, error))
+          return false;
+      }
+
+      if (live::argValue(argc, argv, "--patches", value))
+        config.patch_dir = File::getCurrentWorkingDirectory().getChildFile(value);
+      if (live::argValue(argc, argv, "--port-name", value))
+        config.midi_port_name = value;
+      if (live::argValue(argc, argv, "--midi-inputs", value))
+        config.midi_inputs = value;
+      if (live::argValue(argc, argv, "--audio-device", value))
+        config.audio_device = value;
+      if (live::argValue(argc, argv, "--rate", value))
+        config.sample_rate = value.getDoubleValue();
+      if (live::argValue(argc, argv, "--buffer", value))
+        config.buffer_size = value.getIntValue();
+      if (live::argValue(argc, argv, "--default-program", value))
+        config.default_program = value.getIntValue();
+      if (live::argValue(argc, argv, "--channel", value))
+        config.program_channel = value.getIntValue();
+
+      if (config.patch_dir == File() || !config.patch_dir.isDirectory()) {
+        error = "Patch directory missing or not a directory (use --patches <dir>): " +
+                config.patch_dir.getFullPathName();
         return false;
       }
       return true;
@@ -84,11 +146,10 @@ class LiveSynth : public HeadlessSynth, public AudioSource, private Timer {
     ~LiveSynth() override { stop(); }
 
     bool start() {
-      loadPatches();
+      live::log("Patch dir: " + config_.patch_dir.getFullPathName() + " (" + String((int)scanPatchDir(false).size()) +
+                " numbered patches)");
 
-      if (config_.default_program >= 0 && patches_.count(config_.default_program))
-        loadProgram(config_.default_program);
-      else
+      if (config_.default_program < 0 || !loadProgram(config_.default_program))
         loadInitPreset();
 
       if (!startAudio())
@@ -151,8 +212,9 @@ class LiveSynth : public HeadlessSynth, public AudioSource, private Timer {
     static constexpr int kPollMs = 25;
     static constexpr int kHotplugMs = 500;
 
-    struct Patch {
+    struct CachedPatch {
       File file;
+      Time modified;
       json state;
     };
 
@@ -171,47 +233,70 @@ class LiveSynth : public HeadlessSynth, public AudioSource, private Timer {
       LiveSynth* owner = nullptr;
     };
 
-    void loadPatches() {
-      for (const auto& entry : config_.programs) {
-        Patch patch;
-        patch.file = entry.second;
-        try {
-          if (!patch.file.existsAsFile()) {
-            live::log("Missing patch file: " + patch.file.getFullPathName());
-            continue;
-          }
-          patch.state = json::parse(patch.file.loadFileAsString().toStdString(), nullptr);
-          patches_[entry.first] = std::move(patch);
+    // program number -> file; first name (sorted) wins on duplicates.
+    std::map<int, File> scanPatchDir(bool warn_duplicates = true) {
+      Array<File> found;
+      config_.patch_dir.findChildFiles(found, File::findFiles, false, "*.vital");
+      std::vector<File> files(found.begin(), found.end());
+      std::sort(files.begin(), files.end(), [](const File& a, const File& b) {
+        return a.getFileName() < b.getFileName();
+      });
+
+      std::map<int, File> index;
+      for (const File& file : files) {
+        int program = live::programFromName(file.getFileName());
+        if (program < 0)
+          continue;
+        if (index.count(program)) {
+          if (warn_duplicates)
+            live::log("Duplicate program " + String(program) + ": ignoring " + file.getFileName());
+          continue;
         }
-        catch (const std::exception& e) {
-          live::log("Cannot parse " + patch.file.getFullPathName() + ": " + e.what());
-        }
+        index[program] = file;
       }
-      live::log("Loaded " + String((int)patches_.size()) + " patches");
+      return index;
     }
 
     // Runs on the message thread (never from the MIDI or audio thread).
     bool loadProgram(int program) {
-      auto it = patches_.find(program);
-      if (it == patches_.end()) {
-        live::log("Program " + String(program) + " is not mapped; keeping current patch");
+      std::map<int, File> index = scanPatchDir();
+      auto found = index.find(program);
+      if (found == index.end()) {
+        live::log("No patch numbered " + String(program) + " in " + config_.patch_dir.getFileName() +
+                  "; keeping current patch");
         return false;
       }
 
+      const File file = found->second;
+      const Time modified = file.getLastModificationTime();
+      CachedPatch& cached = cache_[program];
+      if (cached.file != file || cached.modified != modified) {
+        try {
+          cached.state = json::parse(file.loadFileAsString().toStdString(), nullptr);
+          cached.file = file;
+          cached.modified = modified;
+        }
+        catch (const std::exception& e) {
+          live::log("Cannot parse " + file.getFileName() + ": " + e.what());
+          cache_.erase(program);
+          return false;
+        }
+      }
+
       try {
-        if (!loadFromJson(it->second.state)) {
-          live::log("Patch was created with a newer Vital version: " + it->second.file.getFileName());
+        if (!loadFromJson(cached.state)) {
+          live::log("Patch was created with a newer Vital version: " + file.getFileName());
           return false;
         }
       }
       catch (const std::exception& e) {
-        live::log("Patch load failed: " + it->second.file.getFileName() + " (" + e.what() + ")");
+        live::log("Patch load failed: " + file.getFileName() + " (" + e.what() + ")");
         return false;
       }
 
-      active_file_ = it->second.file;
-      setPresetName(it->second.file.getFileNameWithoutExtension());
-      live::log("Program " + String(program) + " -> " + it->second.file.getFileName());
+      active_file_ = file;
+      setPresetName(file.getFileNameWithoutExtension());
+      live::log("Program " + String(program) + " -> " + file.getFileName());
       return true;
     }
 
@@ -264,10 +349,27 @@ class LiveSynth : public HeadlessSynth, public AudioSource, private Timer {
       refreshMidiInputs();
     }
 
+    bool isHardwareInputAllowed(const String& name) const {
+      String filter = config_.midi_inputs.trim();
+      if (filter.isEmpty())
+        return false;
+      if (filter.equalsIgnoreCase("all"))
+        return true;
+
+      StringArray parts;
+      parts.addTokens(filter, ",", "");
+      for (const String& part : parts) {
+        String substring = part.trim();
+        if (substring.isNotEmpty() && name.containsIgnoreCase(substring))
+          return true;
+      }
+      return false;
+    }
+
     void refreshMidiInputs() {
       StringArray midi_ins(MidiInput::getDevices());
       for (const String& midi_in : midi_ins) {
-        if (!current_midi_ins_.contains(midi_in)) {
+        if (!current_midi_ins_.contains(midi_in) && isHardwareInputAllowed(midi_in)) {
           device_manager_.setMidiInputEnabled(midi_in, true);
           live::log("MIDI input enabled: " + midi_in);
         }
@@ -294,7 +396,7 @@ class LiveSynth : public HeadlessSynth, public AudioSource, private Timer {
     }
 
     Config config_;
-    std::map<int, Patch> patches_;
+    std::map<int, CachedPatch> cache_;
     std::atomic<int> pending_program_{-1};
     AudioDeviceManager device_manager_;
     AudioSourcePlayer audio_player_;
@@ -306,38 +408,30 @@ class LiveSynth : public HeadlessSynth, public AudioSource, private Timer {
     int poll_ms_ = 0;
 };
 
-// Entry point for `vital --live --config <file>`.
-inline int runLiveSynth(const String& config_path) {
+// Entry point for `vital --live --patches <dir> [--port-name N] [--midi-inputs S] [--config F] ...`.
+inline int runLiveSynth(int argc, const char* argv[]) {
   MessageManager::getInstance();  // the calling thread becomes the message thread
 
   int result = 0;
   {
-    if (config_path.isEmpty()) {
-      live::log("Usage: vital --live --config <config.json>");
+    LiveSynth::Config config;
+    String error;
+    if (!LiveSynth::parseCommandLine(argc, argv, config, error)) {
+      live::log(error);
+      live::log("Usage: vital --live --patches <dir> [--port-name NAME] [--midi-inputs all|Akai,..] "
+                "[--audio-device NAME] [--rate HZ] [--buffer N] [--default-program N] [--channel 1-16] "
+                "[--config file.json]");
       result = 1;
     }
     else {
-      File config_file = File::getCurrentWorkingDirectory().getChildFile(config_path);
-      LiveSynth::Config config;
-      String error;
-      if (!config_file.existsAsFile()) {
-        live::log("Config not found: " + config_file.getFullPathName());
-        result = 1;
-      }
-      else if (!LiveSynth::loadConfig(config_file, config, error)) {
-        live::log(error);
-        result = 1;
-      }
-      else {
-        std::signal(SIGINT, live::signalHandler);
-        std::signal(SIGTERM, live::signalHandler);
+      std::signal(SIGINT, live::signalHandler);
+      std::signal(SIGTERM, live::signalHandler);
 
-        LiveSynth synth(config);
-        if (synth.start())
-          MessageManager::getInstance()->runDispatchLoop();
-        else
-          result = 1;
-      }
+      LiveSynth synth(config);
+      if (synth.start())
+        MessageManager::getInstance()->runDispatchLoop();
+      else
+        result = 1;
     }
   }
 
