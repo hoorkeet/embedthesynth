@@ -1,6 +1,7 @@
 // Live (non-render) mode for the headless Vital build.
 // Header-only: ALSA audio, virtual ALSA MIDI port (+ optional hardware inputs),
 // Program Change N -> first "<N>*.vital" file in a patch directory.
+// MIDI Clock (24 per beat) sets the tempo of the synth, Start / Song Position put its beat position (tempo synced LFOs, delays ... line up with the song).
 #pragma once
 
 #include "JuceHeader.h"
@@ -10,6 +11,8 @@
 #include "synth_constants.h"
 
 #include <algorithm>
+#include <cmath>
+#include <utility>
 #include <atomic>
 #include <csignal>
 #include <iostream>
@@ -187,19 +190,19 @@ class LiveSynth : public HeadlessSynth, public AudioSource, private Timer {
 
       ScopedLock lock(getCriticalSection());
 
+      applyClock();
       processModulationChanges();
       MidiBuffer midi_messages;
       midi_manager_->removeNextBlockOfMessages(midi_messages, num_samples);
 
       const int synth_samples = std::min(num_samples, vital::kMaxBufferSize);
-      const double sample_time = 1.0 / sample_rate_;
       for (int b = 0; b < num_samples; b += synth_samples) {
         int current_samples = std::min(synth_samples, num_samples - b);
         engine_->correctToTime(current_time_);
 
         processMidi(midi_messages, b, b + current_samples);
         processAudio(buffer, channels, current_samples, info.startSample + b);
-        current_time_ += current_samples * sample_time;
+        advanceTime(current_samples);
       }
 
       for (int c = channels; c < buffer->getNumChannels(); ++c)
@@ -208,9 +211,80 @@ class LiveSynth : public HeadlessSynth, public AudioSource, private Timer {
 
     void releaseResources() override { }
 
+    // Offline: a MIDI file through the patch of a program, faster than real time, to a wav (32 bit, stereo). bpm is the tempo of the synth, as the MIDI clock sets it in the live mode,
+    // and turns the ticks of the file into time; time 0 is beat 0, as after a Start. Goes on after the last event until it is quiet for half a second (at most max_tail seconds).
+    bool renderMidi(const File& midi_file, const File& wav_file, int program, double bpm, double max_tail) {
+      FileInputStream input(midi_file);
+      MidiFile midi;
+      if (!input.openedOk() || !midi.readFrom(input) || midi.getTimeFormat() <= 0 || bpm <= 0.0) {
+        live::log("Cannot read MIDI file (ticks per beat needed): " + midi_file.getFullPathName());
+        return false;
+      }
+      if (!loadProgram(program))
+        return false;
+
+      const double rate = config_.sample_rate;
+      std::vector<std::pair<long long, MidiMessage>> events;
+      for (int i = 0; i < midi.getNumTracks(); ++i) {
+        const MidiMessageSequence* track = midi.getTrack(i);
+        for (int j = 0; j < track->getNumEvents(); ++j) {
+          const MidiMessage& m = track->getEventPointer(j)->message;
+          if (!m.isMetaEvent() && !m.isProgramChange() && !m.isSysEx())
+            events.emplace_back((long long)std::llround(m.getTimeStamp() / midi.getTimeFormat() * 60.0 / bpm * rate), m);
+        }
+      }
+      std::stable_sort(events.begin(), events.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+      const long long last = events.empty() ? 0 : events.back().first;
+
+      wav_file.deleteFile();
+      WavAudioFormat wav;
+      std::unique_ptr<AudioFormatWriter> writer(wav.createWriterFor(new FileOutputStream(wav_file), rate, vital::kNumChannels, 32,
+                                                                     StringPairArray(), 0));
+      if (!writer) {
+        live::log("Cannot write " + wav_file.getFullPathName());
+        return false;
+      }
+
+      prepareToPlay(kRenderBlock, rate);
+      engine_->setBpm((float)bpm);
+      AudioSampleBuffer buffer(vital::kNumChannels, kRenderBlock);
+      ScopedLock lock(getCriticalSection());
+      const long long limit = last + (long long)(max_tail * rate);
+      long long start = 0, quiet = 0;
+      size_t next = 0;
+
+      while (start < limit) {
+        MidiBuffer block;
+        for (; next < events.size() && events[next].first < start + kRenderBlock; ++next)
+          block.addEvent(events[next].second, (int)(events[next].first - start));
+
+        buffer.clear();
+        processModulationChanges();
+        for (int b = 0; b < kRenderBlock; b += vital::kMaxBufferSize) {
+          int count = std::min(vital::kMaxBufferSize, kRenderBlock - b);
+          engine_->correctToTime(current_time_);
+          processMidi(block, b, b + count);
+          processAudio(&buffer, vital::kNumChannels, count, b);
+          current_time_ += count / rate;
+        }
+        writer->writeFromAudioSampleBuffer(buffer, 0, kRenderBlock);
+        start += kRenderBlock;
+
+        if (start > last) {
+          float peak = std::max(buffer.getMagnitude(0, 0, kRenderBlock), buffer.getMagnitude(1, 0, kRenderBlock));
+          quiet = peak < 1e-4f ? quiet + kRenderBlock : 0;
+          if (quiet >= rate / 2)
+            break;
+        }
+      }
+      live::log("Rendered " + String(start / rate, 1) + " s: " + wav_file.getFullPathName());
+      return true;
+    }
+
   private:
     static constexpr int kPollMs = 25;
     static constexpr int kHotplugMs = 500;
+    static constexpr int kRenderBlock = 256;
 
     struct CachedPatch {
       File file;
@@ -218,9 +292,55 @@ class LiveSynth : public HeadlessSynth, public AudioSource, private Timer {
       json state;
     };
 
-    // Receives all MIDI. Program Change is handled here; the rest goes to Vital's MidiManager.
+    // Receives all MIDI. Program Change and the clock are handled here; the rest goes to Vital's MidiManager.
     struct MidiRouter : public MidiInputCallback {
+      // The tempo is measured over blocks of kBlock ticks (2 beats). It is published only when two blocks in a row agree (a block with a late tick or a change of the tempo in it is thrown away),
+      // it is rounded (whole bpm if within 0.2 of one, else 0.1), and it replaces the tempo in use only when it is clearly different (0.3 %). So the tempo never wobbles - a wobble would pitch the tails of the delays.
+      enum { kBlock = 48 };
+
+      void onClock() {
+        const double now = Time::getMillisecondCounterHiRes() * 0.001;
+        if (n > 0 && now - last > 0.5) {  // the clock stopped: begin again
+          n = 0;
+          prev = 0.0;
+        }
+        last = now;
+        if (n == 0)
+          start = now;
+        if (++n <= kBlock)
+          return;
+
+        const double bpm = 60.0 * kBlock / (24.0 * (now - start));
+        if (bpm >= 20.0 && bpm <= 400.0) {
+          if (prev > 0.0 && std::abs(bpm - prev) < prev * 0.0015) {
+            const double mean = 0.5 * (bpm + prev), whole = std::round(mean);
+            const double tempo = std::abs(mean - whole) < 0.2 ? whole : std::round(mean * 10.0) / 10.0;
+            const float known = owner->clock_bpm_.load();
+            if (known <= 0.0f || std::abs(tempo - known) >= std::max(0.25, 0.003 * known))
+              owner->clock_bpm_.store((float)tempo);
+          }
+          prev = bpm;
+        }
+        start = now;
+        n = 1;
+      }
+
       void handleIncomingMidiMessage(MidiInput* source, const MidiMessage& message) override {
+        if (message.isMidiClock()) {
+          onClock();
+          return;
+        }
+        if (message.isMidiStart()) {
+          owner->clock_beats_.store(0.0);
+          return;
+        }
+        if (message.isSongPositionPointer()) {
+          owner->clock_beats_.store(message.getSongPositionPointerMidiBeat() / 4.0);  // 16ths -> beats
+          return;
+        }
+        if (message.isMidiContinue() || message.isMidiStop())
+          return;  // the beat position runs on by itself
+
         if (message.isProgramChange()) {
           int channel = owner->config_.program_channel;
           if (channel == 0 || message.getChannel() == channel)
@@ -231,7 +351,37 @@ class LiveSynth : public HeadlessSynth, public AudioSource, private Timer {
       }
 
       LiveSynth* owner = nullptr;
+      double start = 0.0, last = 0.0, prev = 0.0;
+      int n = 0;
     };
+
+    // Audio thread, at the start of a block: the tempo and the beat position that came with the MIDI clock. The beat position never jumps by itself, even when the tempo changes
+    // (the time of the engine is beats / tempo), only a Start or a Song Position moves it.
+    void applyClock() {
+      const float bpm = clock_bpm_.load();
+      if (bpm > 0.0f && bpm != clock_applied_) {
+        if (clock_applied_ <= 0.0f)
+          beats_ = current_time_ * bpm / 60.0;  // the first tempo: on from where the time is
+        engine_->setBpm(bpm);
+        clock_applied_ = bpm;
+        current_time_ = beats_ * 60.0 / bpm;
+      }
+
+      const double position = clock_beats_.exchange(-1.0);
+      if (position >= 0.0 && clock_applied_ > 0.0f) {
+        beats_ = position;
+        current_time_ = beats_ * 60.0 / clock_applied_;
+      }
+    }
+
+    void advanceTime(int samples) {
+      if (clock_applied_ > 0.0f) {
+        beats_ += samples * clock_applied_ / (60.0 * sample_rate_);
+        current_time_ = beats_ * 60.0 / clock_applied_;
+      }
+      else
+        current_time_ += samples / sample_rate_;
+    }
 
     // program number -> file; first name (sorted) wins on duplicates.
     std::map<int, File> scanPatchDir(bool warn_duplicates = true) {
@@ -398,6 +548,10 @@ class LiveSynth : public HeadlessSynth, public AudioSource, private Timer {
     Config config_;
     std::map<int, CachedPatch> cache_;
     std::atomic<int> pending_program_{-1};
+    std::atomic<float> clock_bpm_{0.0f};     // the tempo of the MIDI clock, 0 until there is one
+    std::atomic<double> clock_beats_{-1.0};  // a beat position from Start / Song Position, -1 = none
+    float clock_applied_ = 0.0f;
+    double beats_ = 0.0;
     AudioDeviceManager device_manager_;
     AudioSourcePlayer audio_player_;
     MidiRouter router_;
@@ -432,6 +586,41 @@ inline int runLiveSynth(int argc, const char* argv[]) {
         MessageManager::getInstance()->runDispatchLoop();
       else
         result = 1;
+    }
+  }
+
+  DeletedAtShutdown::deleteAll();
+  MessageManager::deleteInstance();
+  return result;
+}
+
+// Entry point for `vital --render-midi file.mid --patches <dir> --program N --bpm B --out file.wav [--rate HZ] [--tail SECONDS]`.
+inline int runRenderMidi(int argc, const char* argv[]) {
+  MessageManager::getInstance();
+
+  int result = 1;
+  {
+    LiveSynth::Config config;
+    String error, midi, wav, value;
+    int program = 0;
+    double bpm = 120.0, tail = 10.0;
+    live::argValue(argc, argv, "--render-midi", midi);
+    live::argValue(argc, argv, "--out", wav);
+    if (live::argValue(argc, argv, "--program", value))
+      program = value.getIntValue();
+    if (live::argValue(argc, argv, "--bpm", value))
+      bpm = value.getDoubleValue();
+    if (live::argValue(argc, argv, "--tail", value))
+      tail = value.getDoubleValue();
+
+    if (!LiveSynth::parseCommandLine(argc, argv, config, error))
+      live::log(error);
+    else if (midi.isEmpty() || wav.isEmpty())
+      live::log("Usage: vital --render-midi file.mid --patches <dir> --program N --bpm B --out file.wav [--rate HZ] [--tail SECONDS]");
+    else {
+      File cwd = File::getCurrentWorkingDirectory();
+      LiveSynth synth(config);
+      result = synth.renderMidi(cwd.getChildFile(midi), cwd.getChildFile(wav), program, bpm, tail) ? 0 : 1;
     }
   }
 

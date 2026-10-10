@@ -132,6 +132,8 @@ int main(int argc, const char* argv[]) {
   for (int i = 1; i < argc; ++i) {
     if (std::string(argv[i]) == "--live")
       return runLiveSynth(argc, argv);
+    if (std::string(argv[i]) == "--render-midi")
+      return runRenderMidi(argc, argv);
   }
 
   HeadlessSynth headless_synth;
